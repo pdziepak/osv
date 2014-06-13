@@ -65,6 +65,8 @@ private:
     unsigned _size;
 
     struct page_header {
+        explicit page_header(pool& p);
+
         pool* owner;
         unsigned cpu_id;
         unsigned nalloc;

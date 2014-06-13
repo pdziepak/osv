@@ -247,16 +247,7 @@ void pool::add_page()
     // enablment of preemption
     void* page = untracked_alloc_page();
     WITH_LOCK(preempt_lock) {
-        page_header* header = new (page) page_header;
-        header->cpu_id = mempool_cpuid();
-        header->owner = this;
-        header->nalloc = 0;
-        header->local_free = nullptr;
-        for (auto p = page + page_size - _size; p >= header + 1; p -= _size) {
-            auto obj = static_cast<free_object*>(p);
-            obj->next = header->local_free;
-            header->local_free = obj;
-        }
+        page_header* header = new (page) page_header(*this);
         _free->push_back(*header);
         if (_free->empty()) {
             /* encountered when starting to enable TLS for AArch64 in mixed
@@ -333,6 +324,20 @@ pool* pool::from_object(void* object)
 {
     auto header = to_header(static_cast<free_object*>(object));
     return header->owner;
+}
+
+pool::page_header::page_header(pool& pl)
+    : owner(&pl)
+    , cpu_id(mempool_cpuid())
+    , nalloc(0)
+    , local_free(nullptr)
+{
+    void* page = reinterpret_cast<void*>(this);
+    for (auto p = page + page_size - pl.get_size(); p >= this + 1; p -= pl.get_size()) {
+        auto obj = static_cast<free_object*>(p);
+        obj->next = local_free;
+        local_free = obj;
+    }
 }
 
 class malloc_pool : public pool {

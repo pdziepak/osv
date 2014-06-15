@@ -193,8 +193,11 @@ const size_t pool::min_object_size = sizeof(free_object);
 
 pool::page_header* pool::to_header(free_object* object)
 {
-    return reinterpret_cast<page_header*>(
-                 reinterpret_cast<std::uintptr_t>(object) & ~(page_size - 1));
+    std::uintptr_t addr = reinterpret_cast<std::uintptr_t>(object);
+    addr = align_down(addr, page_size);
+    addr += page_size - sizeof(page_header);
+    addr = align_down(addr, alignof(page_header));
+    return reinterpret_cast<pool::page_header*>(addr);
 }
 
 TRACEPOINT(trace_pool_alloc, "this=%p, obj=%p", void*, void*);
@@ -247,7 +250,8 @@ void pool::add_page()
     // enablment of preemption
     void* page = untracked_alloc_page();
     WITH_LOCK(preempt_lock) {
-        page_header* header = new (page) page_header(*this);
+        auto obj = to_header(static_cast<free_object*>(page));
+        page_header* header = new (obj) page_header(*this);
         _free->push_back(*header);
         if (_free->empty()) {
             /* encountered when starting to enable TLS for AArch64 in mixed
@@ -273,7 +277,7 @@ void pool::free_same_cpu(free_object* obj, unsigned cpu_id)
             _free->erase(_free->iterator_to(*header));
         }
         DROP_LOCK(preempt_lock) {
-            untracked_free_page(header);
+            untracked_free_page(align_down(header, page_size));
         }
     } else {
         if (!header->local_free) {
@@ -332,8 +336,8 @@ pool::page_header::page_header(pool& pl)
     , nalloc(0)
     , local_free(nullptr)
 {
-    void* page = reinterpret_cast<void*>(this);
-    for (auto p = page + page_size - pl.get_size(); p >= this + 1; p -= pl.get_size()) {
+    void* page = align_down(static_cast<void*>(this), page_size);
+    for (auto p = page; p + pl.get_size() <= this; p += pl.get_size()) {
         auto obj = static_cast<free_object*>(p);
         obj->next = local_free;
         local_free = obj;

@@ -25,6 +25,7 @@
 #include <lockfree/ring.hh>
 #include <osv/percpu-worker.hh>
 #include <osv/preempt-lock.hh>
+#include <osv/migration-lock.hh>
 #include <osv/sched.hh>
 #include <algorithm>
 #include <osv/prio.hh>
@@ -199,6 +200,12 @@ void* pool::alloc()
 {
     void * ret = nullptr;
     WITH_LOCK(preempt_lock) {
+        if (_free->empty() && !_free_deferred->empty()) {
+            auto& header = _free_deferred->back();
+            _free_deferred->pop_back();
+            header.init();
+            _free->push_back(header);
+        }
 
         // We enable preemption because add_page() may take a Mutex.
         // this loop ensures we have at least one free page that we can
@@ -233,6 +240,26 @@ unsigned pool::get_size()
 static inline void* untracked_alloc_page();
 static inline void untracked_free_page(void *v);
 
+void* pool::alloc_aligned(unsigned alignment)
+{
+    if (alignment <= _size) {
+        return alloc();
+    }
+    assert(alignment <= page_size);
+
+    void* page;
+    WITH_LOCK(migration_lock) {
+        page = untracked_alloc_page();
+        auto obj = to_header(static_cast<free_object*>(page));
+        page_header* header = new (obj) page_header(*this, true);
+        WITH_LOCK(preempt_lock) {
+            _free_deferred->push_back(*header);
+        }
+    }
+
+    return page;
+}
+
 void pool::add_page()
 {
     // FIXME: this function allocated a page and set it up but on rare cases
@@ -241,7 +268,7 @@ void pool::add_page()
     void* page = untracked_alloc_page();
     WITH_LOCK(preempt_lock) {
         auto obj = to_header(static_cast<free_object*>(page));
-        page_header* header = new (obj) page_header(*this);
+        page_header* header = new (obj) page_header(*this, false);
         _free->push_back(*header);
         if (_free->empty()) {
             /* encountered when starting to enable TLS for AArch64 in mixed
@@ -262,7 +289,12 @@ void pool::free_same_cpu(free_object* obj, unsigned cpu_id)
     trace_pool_free_same_cpu(this, object);
 
     page_header* header = to_header(obj);
-    if (!--header->nalloc && have_full_pages()) {
+    if (header->deferred) {
+        _free_deferred->erase(_free->iterator_to(*header));
+        DROP_LOCK(preempt_lock) {
+            untracked_free_page(align_down(header, page_size));
+        }
+    } else if (!--header->nalloc && have_full_pages()) {
         if (header->local_free) {
             _free->erase(_free->iterator_to(*header));
         }
@@ -320,18 +352,31 @@ pool* pool::from_object(void* object)
     return header->owner;
 }
 
-pool::page_header::page_header(pool& pl)
+pool::page_header::page_header(pool& pl, bool defer)
     : owner(&pl)
     , cpu_id(mempool_cpuid())
     , nalloc(0)
     , local_free(nullptr)
+    , deferred(defer)
+{
+    if (!deferred) {
+        init();
+    }
+}
+
+void pool::page_header::init()
 {
     void* page = align_down(static_cast<void*>(this), page_size);
-    for (auto p = page; p + pl.get_size() <= this; p += pl.get_size()) {
+    if (deferred) {
+        page += owner->get_size();
+        nalloc++;
+    }
+    for (auto p = page; p + owner->get_size() <= this; p += owner->get_size()) {
         auto obj = static_cast<free_object*>(p);
         obj->next = local_free;
         local_free = obj;
     }
+    deferred = false;
 }
 
 class malloc_pool : public pool {
@@ -1110,18 +1155,14 @@ static inline void* std_malloc(size_t size, size_t alignment)
     // Currently, we can't allocate a small object with large alignment,
     // so need to increase the allocation size.
     auto requested_size = size;
-    if (alignment > size) {
-        if (alignment <= mmu::page_size) {
-            size = alignment;
-        } else {
-            size = std::max(size, mmu::page_size * 2);
-        }
+    if (alignment > size && alignment > mmu::page_size) {
+        size = std::max(size, mmu::page_size * 2);
     }
 
     if (size <= memory::pool::max_object_size && smp_allocator) {
         size = std::max(size, memory::pool::min_object_size);
         unsigned n = ilog2_roundup(size);
-        ret = memory::malloc_pools[n].alloc();
+        ret = memory::malloc_pools[n].alloc_aligned(alignment);
         ret = translate_mem_area(mmu::mem_area::main, mmu::mem_area::mempool,
                                  ret);
         trace_memory_malloc_mempool(ret, requested_size, 1 << n, alignment);

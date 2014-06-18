@@ -47,6 +47,7 @@ public:
     explicit pool(unsigned size);
     ~pool();
     void* alloc();
+    void* alloc_aligned(unsigned allignment);
     void free(void* object);
     unsigned get_size();
     static pool* from_object(void* object);
@@ -65,13 +66,15 @@ private:
     unsigned _size;
 
     struct page_header {
-        explicit page_header(pool& p);
+        explicit page_header(pool& p, bool defer);
+        void init();
 
         pool* owner;
         unsigned cpu_id;
         unsigned nalloc;
         bi::list_member_hook<> free_link;
         free_object* local_free;  // free objects in this page
+        bool deferred;
     };
 
     typedef bi::list<page_header,
@@ -86,6 +89,7 @@ private:
     };
     // maintain a list of free pages percpu
     dynamic_percpu<free_list_type> _free;
+    dynamic_percpu<free_list_type> _free_deferred;
 public:
     static const size_t max_object_size;
     static const size_t min_object_size;

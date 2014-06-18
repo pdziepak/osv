@@ -1296,8 +1296,9 @@ void free(void* v)
 
 void* realloc(void* v, size_t size)
 {
+    auto alignment = std::min(size, alignof(max_align_t));
     if (!v)
-        return malloc(size, alignof(max_align_t));
+        return malloc(size, alignment);
     if (!size) {
         free(v);
         return nullptr;
@@ -1305,7 +1306,7 @@ void* realloc(void* v, size_t size)
     auto h = static_cast<header*>(v - pad_before);
     if (h->size >= size)
         return v;
-    void* n = malloc(size, alignof(max_align_t));
+    void* n = malloc(size, alignment);
     if (!n)
         return nullptr;
     memcpy(n, v, h->size);
@@ -1317,13 +1318,14 @@ void* realloc(void* v, size_t size)
 
 void* malloc(size_t size)
 {
+    auto alignment = std::min(size, alignof(max_align_t));
 #if CONF_debug_memory == 0
-    void* buf = std_malloc(size, alignof(max_align_t));
+    void* buf = std_malloc(size, alignment);
 #else
-    void* buf = dbg::malloc(size, alignof(max_align_t));
+    void* buf = dbg::malloc(size, alignment);
 #endif
 
-    trace_memory_malloc(buf, size, alignof(max_align_t));
+    trace_memory_malloc(buf, size, alignment);
     return buf;
 }
 

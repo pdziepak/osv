@@ -237,7 +237,7 @@ unsigned pool::get_size()
     return _size;
 }
 
-static inline void* untracked_alloc_page();
+static inline void* untracked_alloc_page(unsigned alignment);
 static inline void untracked_free_page(void *v);
 
 void* pool::alloc_aligned(unsigned alignment)
@@ -245,11 +245,10 @@ void* pool::alloc_aligned(unsigned alignment)
     if (alignment <= _size) {
         return alloc();
     }
-    assert(alignment <= page_size);
 
     void* page;
     WITH_LOCK(migration_lock) {
-        page = untracked_alloc_page();
+        page = untracked_alloc_page(alignment);
         auto obj = to_header(static_cast<free_object*>(page));
         page_header* header = new (obj) page_header(*this, true);
         WITH_LOCK(preempt_lock) {
@@ -265,7 +264,7 @@ void pool::add_page()
     // FIXME: this function allocated a page and set it up but on rare cases
     // we may add this page to the free list of a different cpu, due to the
     // enablment of preemption
-    void* page = untracked_alloc_page();
+    void* page = untracked_alloc_page(page_size);
     WITH_LOCK(preempt_lock) {
         auto obj = to_header(static_cast<free_object*>(page));
         page_header* header = new (obj) page_header(*this, false);
@@ -936,14 +935,19 @@ static void unfill_page_buffer()
     }
 }
 
-static void* alloc_page_local()
+static void* alloc_page_local(unsigned alignment)
 {
     WITH_LOCK(preempt_lock) {
         auto& pbuf = *percpu_page_buffer;
-        if (!pbuf.nr) {
-            return nullptr;
+        for (size_t i = 0; i < pbuf.nr; i++) {
+            if (reinterpret_cast<uintptr_t>(pbuf.free[i]) & (alignment - 1)) {
+                continue;
+            }
+            auto page = pbuf.free[i];
+            pbuf.free[i] = pbuf.free[--pbuf.nr];
+            return page;
         }
-        return pbuf.free[--pbuf.nr];
+        return nullptr;
     }
 }
 
@@ -959,40 +963,46 @@ static bool free_page_local(void* v)
     }
 }
 
-static void* early_alloc_page()
+static void* alloc_page_global(unsigned alignment)
 {
-    WITH_LOCK(free_page_ranges_lock) {
-        if (free_page_ranges.empty()) {
-            debug_early("early_alloc_page(): out of memory\n");
-            abort();
+    while (true) {
+        WITH_LOCK(free_page_ranges_lock) {
+            if (smp_allocator) {
+                reclaimer_thread.wait_for_minimum_memory();
+            }
+            auto header = alloc_page_range(page_size, 0, alignment);
+            if (header) {
+                on_alloc(page_size);
+                return header;
+            }
+            if (smp_allocator) {
+                reclaimer_thread.wait_for_memory(page_size);
+            } else {
+                debug_early("alloc_page_global(): out of memory\n");
+                abort();
+            }
         }
-
-        auto begin = free_page_ranges.begin();
-        auto p = &*begin;
-        p->size -= page_size;
-        on_alloc(page_size);
-        void* page = static_cast<void*>(p) + p->size;
-        if (!p->size) {
-            free_page_ranges.erase(begin);
-        }
-        return page;
     }
 }
 
-static void early_free_page(void* v)
+static void free_page_global(void* v)
 {
     auto pr = new (v) page_range(page_size);
     free_page_range(pr);
 }
 
-static void* untracked_alloc_page()
+static void* untracked_alloc_page(unsigned alignment)
 {
     void* ret;
-
     if (!smp_allocator) {
-        ret = early_alloc_page();
+        ret = alloc_page_global(alignment);
+    } else if (alignment > page_size) {
+        ret = alloc_page_local(alignment);
+        if (!ret) {
+            ret = alloc_page_global(alignment);
+        }
     } else {
-        while (!(ret = alloc_page_local())) {
+        while (!(ret = alloc_page_local(page_size))) {
             refill_page_buffer();
         }
     }
@@ -1000,18 +1010,23 @@ static void* untracked_alloc_page()
     return ret;
 }
 
-void* alloc_page()
+static void* alloc_page(unsigned alignment)
 {
-    void *p = untracked_alloc_page();
+    void *p = untracked_alloc_page(alignment);
     tracker_remember(p, page_size);
     return p;
+}
+
+void* alloc_page()
+{
+    return alloc_page(page_size);
 }
 
 static inline void untracked_free_page(void *v)
 {
     trace_memory_page_free(v);
     if (!smp_allocator) {
-        return early_free_page(v);
+        return free_page_global(v);
     }
     while (!free_page_local(v)) {
         unfill_page_buffer();
@@ -1157,23 +1172,17 @@ static inline void* std_malloc(size_t size, size_t alignment)
 
     // Currently, we can't allocate a small object with large alignment,
     // so need to increase the allocation size.
-    auto requested_size = size;
-    if (alignment > size && alignment > mmu::page_size) {
-        size = std::max(size, mmu::page_size * 2);
-    }
-
     if (size <= memory::pool::max_object_size && smp_allocator) {
         size = std::max(size, memory::pool::min_object_size);
         unsigned n = ilog2_roundup(size);
         ret = memory::malloc_pools[n].alloc_aligned(alignment);
         ret = translate_mem_area(mmu::mem_area::main, mmu::mem_area::mempool,
                                  ret);
-        trace_memory_malloc_mempool(ret, requested_size, 1 << n, alignment);
+        trace_memory_malloc_mempool(ret, size, 1 << n, alignment);
     } else if (size <= mmu::page_size) {
         ret = mmu::translate_mem_area(mmu::mem_area::main, mmu::mem_area::page,
-                                       memory::alloc_page());
-        trace_memory_malloc_page(ret, requested_size, mmu::page_size,
-                                 alignment);
+                                       memory::alloc_page(alignment));
+        trace_memory_malloc_page(ret, size, mmu::page_size, alignment);
     } else {
         ret = memory::malloc_large(size, alignment);
     }

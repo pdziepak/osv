@@ -576,6 +576,34 @@ void reclaimer::wait_for_memory(size_t mem)
     _oom_blocked.wait(mem);
 }
 
+static page_range* alloc_page_range(size_t size, size_t offset, size_t alignment)
+{
+    for (auto&& header : free_page_ranges) {
+        auto v = reinterpret_cast<char*>(&header);
+        auto expected_ret = v + header.size - size + offset;
+        auto alignment_shift = expected_ret - align_down(expected_ret, alignment);
+        if (header.size >= size + alignment_shift) {
+            if (alignment_shift) {
+                // Leave "alignment_shift" bytes at the end of the
+                // range free, so our allocation below is aligned.
+                free_page_ranges.insert(*new(v + header.size -
+                        alignment_shift) page_range(alignment_shift));
+                header.size -= alignment_shift;
+            }
+            page_range* ret_header;
+            if (header.size == size) {
+                free_page_ranges.erase(free_page_ranges.iterator_to(header));
+                ret_header = &header;
+            } else {
+                header.size -= size;
+                ret_header = new (v + header.size) page_range(size);
+            }
+            return ret_header;
+        }
+    }
+    return nullptr;
+}
+
 static void* malloc_large(size_t size, size_t alignment)
 {
     auto requested_size = size;
@@ -591,38 +619,13 @@ static void* malloc_large(size_t size, size_t alignment)
     while (true) {
         WITH_LOCK(free_page_ranges_lock) {
             reclaimer_thread.wait_for_minimum_memory();
-
-            for (auto i = free_page_ranges.begin(); i != free_page_ranges.end(); ++i) {
-                auto header = &*i;
-
-                char *v = reinterpret_cast<char*>(header);
-                auto expected_ret = v + header->size - size + page_size;
-                auto alignment_shift = expected_ret -
-                        align_down(expected_ret, alignment);
-
-                if (header->size >= size + alignment_shift) {
-                    if (alignment_shift) {
-                        // Leave "alignment_shift" bytes at the end of the
-                        // range free, so our allocation below is aligned.
-                        free_page_ranges.insert(*new(v + header->size -
-                                alignment_shift) page_range(alignment_shift));
-                        header->size -= alignment_shift;
-                    }
-                    page_range* ret_header;
-                    if (header->size == size) {
-                        free_page_ranges.erase(i);
-                        ret_header = header;
-                    } else {
-                        header->size -= size;
-                        ret_header = new (v + header->size) page_range(size);
-                    }
-                    on_alloc(size);
-                    void* obj = ret_header;
-                    obj += offset;
-                    trace_memory_malloc_large(obj, requested_size, size,
-                                              alignment);
-                    return obj;
-                }
+            auto header = alloc_page_range(size, page_size, alignment);
+            if (header) {
+                on_alloc(size);
+                void* obj = header;
+                obj += offset;
+                trace_memory_malloc_large(obj, requested_size, size, alignment);
+                return obj;
             }
             reclaimer_thread.wait_for_memory(size);
         }

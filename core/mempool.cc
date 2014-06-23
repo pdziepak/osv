@@ -437,6 +437,19 @@ struct addr_cmp {
     }
 };
 
+struct size_cmp {
+    bool operator()(const page_range& fpr1, const page_range& fpr2) const {
+        return fpr1.size < fpr2.size;
+    }
+};
+
+struct size_cmp_key {
+    bool operator()(const page_range& fpr1, size_t key) const {
+        return fpr1.size < key;
+    }
+};
+
+
 namespace bi = boost::intrusive;
 
 mutex free_page_ranges_lock;
@@ -446,6 +459,12 @@ bi::set<page_range,
                        bi::set_member_hook<>,
                        &page_range::member_hook>
        > free_page_ranges __attribute__((init_priority((int)init_prio::fpranges)));
+bi::multiset<page_range,
+             bi::compare<size_cmp>,
+             bi::member_hook<page_range,
+                             bi::set_member_hook<>,
+                             &page_range::size_member_hook>
+            > free_page_ranges_size __attribute__((init_priority((int)init_prio::fpranges)));
 
 // Our notion of free memory is "whatever is in the page ranges". Therefore it
 // starts at 0, and increases as we add page ranges.
@@ -577,7 +596,9 @@ void reclaimer::wait_for_memory(size_t mem)
 
 static page_range* alloc_page_range(size_t size, size_t offset, size_t alignment)
 {
-    for (auto&& header : free_page_ranges) {
+    auto it = free_page_ranges_size.lower_bound(size, size_cmp_key());
+    while (it != free_page_ranges_size.end()) {
+        auto& header = *it;
         auto v = reinterpret_cast<char*>(&header);
         auto expected_ret = v + header.size - size + offset;
         auto alignment_shift = expected_ret - align_down(expected_ret, alignment);
@@ -585,20 +606,27 @@ static page_range* alloc_page_range(size_t size, size_t offset, size_t alignment
             if (alignment_shift) {
                 // Leave "alignment_shift" bytes at the end of the
                 // range free, so our allocation below is aligned.
-                free_page_ranges.insert(*new(v + header.size -
-                        alignment_shift) page_range(alignment_shift));
+                auto& npr = *new(v + header.size - alignment_shift) page_range(alignment_shift);
+                free_page_ranges.insert(npr);
+                free_page_ranges_size.insert(npr);
+                free_page_ranges_size.erase(free_page_ranges_size.iterator_to(header));
                 header.size -= alignment_shift;
+                free_page_ranges_size.insert(header);
             }
             page_range* ret_header;
             if (header.size == size) {
                 free_page_ranges.erase(free_page_ranges.iterator_to(header));
+                free_page_ranges_size.erase(free_page_ranges_size.iterator_to(header));
                 ret_header = &header;
             } else {
+                free_page_ranges_size.erase(free_page_ranges_size.iterator_to(header));
                 header.size -= size;
+                free_page_ranges_size.insert(header);
                 ret_header = new (v + header.size) page_range(size);
             }
             return ret_header;
         }
+        it++;
     }
     return nullptr;
 }
@@ -815,8 +843,11 @@ static page_range* merge(page_range* a, page_range* b)
     void* vb = b;
 
     if (va + a->size == vb) {
+        free_page_ranges_size.erase(free_page_ranges_size.iterator_to(*a));
         a->size += b->size;
-        free_page_ranges.erase(*b);
+        free_page_ranges.erase(free_page_ranges.iterator_to(*b));
+        free_page_ranges_size.erase(free_page_ranges_size.iterator_to(*b));
+        free_page_ranges_size.insert(*a);
         return a;
     } else {
         return b;
@@ -828,6 +859,7 @@ static page_range* merge(page_range* a, page_range* b)
 static void free_page_range_locked(page_range *range)
 {
     auto i = free_page_ranges.insert(*range).first;
+    free_page_ranges_size.insert(*range);
 
     on_free(range->size);
 
@@ -900,11 +932,14 @@ static void refill_page_buffer()
                     break;
                 auto p = &*it;
                 auto size = std::min(p->size, (limit - pbuf.nr) * page_size);
+                free_page_ranges_size.erase(free_page_ranges_size.iterator_to(*p));
                 p->size -= size;
                 total_size += size;
                 void* pages = static_cast<void*>(p) + p->size;
                 if (!p->size) {
                     free_page_ranges.erase(it);
+                } else {
+                    free_page_ranges_size.insert(*p);
                 }
                 while (size) {
                     pbuf.free[pbuf.nr++] = pages;
@@ -1066,6 +1101,7 @@ void* alloc_huge_page(size_t N)
             if (ret==v) {
                 alloc_size = range->size;
                 free_page_ranges.erase(i);
+                free_page_ranges_size.erase(free_page_ranges_size.iterator_to(*range));
             } else {
                 // Note that this is is done conditionally because we are
                 // operating page ranges. That is what is left on our page
@@ -1074,7 +1110,9 @@ void* alloc_huge_page(size_t N)
                 // later on wiped by the on_free() call that exists within
                 // free_page_range in the conditional right below us.
                 alloc_size = range->size - (ret - v);
+                free_page_ranges_size.erase(free_page_ranges_size.iterator_to(*range));
                 range->size = ret-v;
+                free_page_ranges_size.insert(*range);
             }
             on_alloc(alloc_size);
 

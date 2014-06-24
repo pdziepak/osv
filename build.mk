@@ -302,6 +302,7 @@ tests += tests/misc-tcp-close-without-reading.so
 tests += tests/tst-sigwait.so
 tests += tests/tst-sampler.so
 tests += tests/misc-malloc.so
+tests += tests/tst-discont-malloc.so
 tests += tests/misc-memcpy.so
 tests += tests/misc-free-perf.so
 tests += tests/tst-fallocate.so

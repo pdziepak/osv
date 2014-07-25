@@ -33,6 +33,8 @@ namespace mmu {
 // when we know it was dynamically allocated
 inline phys virt_to_phys_dynamic_phys(void* virt)
 {
+    assert(virt < (void*)mmu::get_mem_area_base(mmu::mem_area::non_contig));
+
     return static_cast<char*>(virt) - phys_mem;
 }
 
@@ -261,7 +263,9 @@ template <typename OutputFunc>
 inline
 void virt_to_phys(void* vaddr, size_t len, OutputFunc out)
 {
-    if (CONF_debug_memory && vaddr >= debug_base) {
+    switch (get_mem_area(vaddr)) {
+    case mem_area::debug:
+    case mem_area::non_contig:
         while (len) {
             auto next = std::min(align_down(vaddr + page_size, page_size), vaddr + len);
             size_t delta = static_cast<char*>(next) - static_cast<char*>(vaddr);
@@ -269,8 +273,10 @@ void virt_to_phys(void* vaddr, size_t len, OutputFunc out)
             vaddr = next;
             len -= delta;
         }
-    } else {
+        break;
+    default:
         out(virt_to_phys(vaddr), len);
+        break;
     }
 }
 

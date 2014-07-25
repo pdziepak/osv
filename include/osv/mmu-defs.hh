@@ -34,6 +34,7 @@ enum class mem_area {
     page,
     mempool,
     debug,
+    non_contig,
 };
 
 constexpr mem_area identity_mapped_areas[] = {

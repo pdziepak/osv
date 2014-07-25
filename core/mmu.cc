@@ -116,6 +116,9 @@ phys virt_to_phys(void *virt)
     // For now, only allow non-mmaped areas.  Later, we can either
     // bounce such addresses, or lock them in memory and translate
     assert(virt >= phys_mem);
+    if (get_mem_area(virt) == mem_area::non_contig) {
+        return virt_to_phys_pt(virt);
+    }
     return reinterpret_cast<uintptr_t>(virt) & (mem_area_size - 1);
 }
 
@@ -206,6 +209,13 @@ struct page_allocator {
     virtual bool map(uintptr_t offset, hw_ptep<1> ptep, pt_element<1> pte, bool write) = 0;
     virtual bool unmap(void *addr, uintptr_t offset, hw_ptep<0> ptep) = 0;
     virtual bool unmap(void *addr, uintptr_t offset, hw_ptep<1> ptep) = 0;
+    virtual void free(void* addr, size_t size) {
+        if (size == page_size) {
+            memory::free_page(addr);
+        } else {
+            memory::free_huge_page(addr, size);
+        }
+    }
     virtual ~page_allocator() {}
 };
 
@@ -558,6 +568,7 @@ public:
 };
 
 struct tlb_gather {
+    tlb_gather(page_allocator* pa) : pa(pa) { }
     static constexpr size_t max_pages = 20;
     struct tlb_page {
         void* addr;
@@ -565,6 +576,7 @@ struct tlb_gather {
     };
     size_t nr_pages = 0;
     tlb_page pages[max_pages];
+    page_allocator* pa;
     bool push(void* addr, size_t size) {
         bool flushed = false;
         if (nr_pages == max_pages) {
@@ -581,11 +593,7 @@ struct tlb_gather {
         mmu::flush_tlb_all();
         for (auto i = 0u; i < nr_pages; ++i) {
             auto&& tp = pages[i];
-            if (tp.size == page_size) {
-                memory::free_page(tp.addr);
-            } else {
-                memory::free_huge_page(tp.addr, tp.size);
-            }
+            pa->free(tp.addr, tp.size);
         }
         nr_pages = 0;
         return true;
@@ -603,7 +611,7 @@ private:
     page_allocator* _pops;
     bool do_flush = false;
 public:
-    unpopulate(page_allocator* pops) : _pops(pops) {}
+    unpopulate(page_allocator* pops) :  _tlb_gather(pops), _pops(pops) {}
     template<int N>
     bool page(hw_ptep<N> ptep, uintptr_t offset) {
         void* addr = phys_to_virt(ptep.read().addr());
@@ -883,7 +891,7 @@ static error sync(const void* addr, size_t length, int flags)
 }
 
 class uninitialized_anonymous_page_provider : public page_allocator {
-private:
+protected:
     virtual void* fill(void* addr, uint64_t offset, uintptr_t size) {
         return addr;
     }
@@ -997,9 +1005,72 @@ uintptr_t allocate(vma *v, uintptr_t start, size_t size, bool search)
     return start;
 }
 
+class preallocated_page_provider : public page_allocator {
+public:
+    preallocated_page_provider(memory::page_range_list& list) : _list(list), _offset(0) { }
+    virtual bool map(uintptr_t offset, hw_ptep<0> ptep, pt_element<0> pte, bool write) override {
+        assert(!_list.empty());
+        auto& pr = _list.front();
+        auto page = static_cast<void*>(&pr) + _offset; 
+        _offset += page_size;
+        if (pr.size == _offset) {
+            _list.pop_front();
+            _offset = 0;
+        }
+//        debug_ll("%p\n", page);
+        return set_pte(page, ptep, pte);
+    }
+    virtual bool map(uintptr_t offset, hw_ptep<1> ptep, pt_element<1> pte, bool write) override {
+        abort();
+    }
+    virtual bool unmap(void* addr, uintptr_t offset, hw_ptep<0> ptep) override {
+        clear_pte(ptep);
+        return true;
+    }
+    virtual bool unmap(void* addr, uintptr_t offset, hw_ptep<1> ptep) override {
+        abort();
+    }
+    virtual void free(void* addr, size_t size) override {
+        assert(size == page_size);
+        if (_list.empty() || static_cast<void*>(&_list.back()) + _list.back().size != addr) {
+            _list.push_back(*new (addr) memory::page_range(page_size));
+        } else {
+            _list.back().size += page_size;
+        }
+    }
+private:
+    bool set_pte(void *addr, hw_ptep<0> ptep, pt_element<0> pte) {
+        auto result = write_pte(addr, ptep, pte);
+        assert(result);
+        return true;
+    }
+
+    memory::page_range_list& _list;
+    unsigned _offset;
+};
+
+
 inline bool in_vma_range(void* addr)
 {
     return reinterpret_cast<long>(addr) >= 0;
+}
+
+void vpopulate_preallocated(void* addr, size_t size, memory::page_range_list& list)
+{
+    assert(!in_vma_range(addr));
+    WITH_LOCK(page_table_high_mutex) {
+        preallocated_page_provider map(list);
+        operate_range(populate_small<>(&map, perm_rwx), addr, size);
+    }
+}
+
+void vdepopulate_preallocated(void* addr, size_t size, memory::page_range_list& list)
+{
+    assert(!in_vma_range(addr));
+    WITH_LOCK(page_table_high_mutex) {
+        preallocated_page_provider map(list);
+        operate_range(unpopulate<>(&map), addr, size);
+    }
 }
 
 void vpopulate(void* addr, size_t size)

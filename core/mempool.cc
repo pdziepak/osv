@@ -43,6 +43,9 @@ TRACEPOINT(trace_memory_malloc_large, "buf=%p, req_len=%d, alloc_len=%d,"
            " align=%d", void*, size_t, size_t, size_t);
 TRACEPOINT(trace_memory_malloc_page, "buf=%p, req_len=%d, alloc_len=%d,"
            " align=%d", void*, size_t, size_t, size_t);
+TRACEPOINT(trace_memory_malloc_noncontig, "buf=%p, req_len=%d, alloc_len=%d,"
+           " align=%d", void*, size_t, size_t, size_t);
+TRACEPOINT(trace_memory_free_noncontig, "buf=%p, len=%d", void*, size_t);
 TRACEPOINT(trace_memory_free, "buf=%p", void *);
 TRACEPOINT(trace_memory_realloc, "in=%p, newlen=%d, out=%p", void *, size_t, void *);
 TRACEPOINT(trace_memory_page_alloc, "page=%p", void*);
@@ -50,6 +53,9 @@ TRACEPOINT(trace_memory_page_free, "page=%p", void*);
 TRACEPOINT(trace_memory_huge_failure, "page ranges=%d", unsigned long);
 TRACEPOINT(trace_memory_reclaim, "shrinker %s, target=%d, delta=%d", const char *, long, long);
 TRACEPOINT(trace_memory_wait, "allocation size=%d", size_t);
+
+TRACEPOINT(trace_nc_alloc, "%p %u", void*, size_t);
+TRACEPOINT(trace_nc_free, "%p %u", void*, size_t);
 
 bool smp_allocator = false;
 unsigned char *osv_reclaimer_thread;
@@ -525,7 +531,7 @@ public:
     page_range_allocator() : _deferred_free(nullptr) { }
 
     template<bool UseBitmap = true>
-    page_range* alloc(size_t size);
+    page_range* alloc(size_t size, size_t min_size = -1, bool fill = false);
     page_range* alloc_aligned(size_t size, size_t offset, size_t alignment,
                               bool fill = false);
     void free(page_range* pr);
@@ -596,14 +602,14 @@ private:
     }
     void set_bits(page_range& pr, bool value, bool fill = false) {
         auto end = pr.size / page_size - 1;
-        if (fill) {
+  //      if (fill) {
             for (unsigned idx = 0; idx <= end; idx++) {
                 _bitmap[get_bitmap_idx(pr) + idx] = value;
             }
-        } else {
+/*        } else {
             _bitmap[get_bitmap_idx(pr)] = value;
             _bitmap[get_bitmap_idx(pr) + end] = value;
-        }
+        }*/
     }
 
     bi::multiset<page_range,
@@ -653,7 +659,7 @@ void page_range_allocator::bitmap_allocator<T>::deallocate(T* p, size_t n)
 }
 
 template<bool UseBitmap>
-page_range* page_range_allocator::alloc(size_t size)
+page_range* page_range_allocator::alloc(size_t size, size_t min_size, bool fill)
 {
     auto exact_order = ilog2_roundup(size / page_size);
     if (exact_order > max_order) {
@@ -667,22 +673,22 @@ page_range* page_range_allocator::alloc(size_t size)
 
     page_range* range = nullptr;
     if (!bitset) {
-        if (!exact_order || _free[exact_order - 1].empty()) {
+        abort();
+        if (min_size >= size || !exact_order) {
             return nullptr;
         }
-        // TODO: This linear search makes worst case complexity of the allocator
-        // O(n). It would be better to fall back to non-contiguous allocation
-        // and make worst case complexity depend on the size of requested memory
-        // block and the logarithm of the number of free huge page ranges.
-        for (auto&& pr : _free[exact_order - 1]) {
-            if (pr.size >= size) {
-                range = &pr;
-                break;
-            }
+        bitset = _not_empty.to_ulong();
+        order = 63 - count_leading_zeros(bitset);
+
+        if (order < ilog2_roundup(min_size / page_size)) {
+            return nullptr;
         }
-        return nullptr;
+        size = (1 << order) * page_size;
     } else if (order == max_order) {
         range = &*_free_huge.rbegin();
+        if (range->size < size && range->size < min_size) {
+            return nullptr;
+        }
         remove_huge(*range);
     } else {
         range = &_free[order].front();
@@ -690,6 +696,7 @@ page_range* page_range_allocator::alloc(size_t size)
     }
 
     auto& pr = *range;
+    assert(pr.size >= size);
     if (pr.size > size) {
         auto& np = *new (static_cast<void*>(&pr) + size)
                         page_range(pr.size - size);
@@ -697,7 +704,7 @@ page_range* page_range_allocator::alloc(size_t size)
         pr.size = size;
     }
     if (UseBitmap) {
-        set_bits(pr, false);
+        set_bits(pr, false, fill);
     }
     return &pr;
 }
@@ -790,7 +797,170 @@ void page_range_allocator::for_each(unsigned min_order, Func f)
     }
 }
 
-static void* malloc_large(size_t size, size_t alignment)
+class noncontig_allocator {
+public:
+    static constexpr uintptr_t base = mmu::get_mem_area_base(mmu::mem_area::non_contig);
+
+    struct header {
+        void* address;
+        size_t size;
+        size_t hole_size;
+        bi::set_member_hook<> hole_size_hook;
+        bi::set_member_hook<> address_hook;
+    };
+
+    noncontig_allocator();
+
+    void* alloc(size_t size);
+    void free(void* addr);
+
+private:
+    std::atomic<char*> last_addr;
+
+    void free_list(page_range_list& list) {
+        WITH_LOCK(free_page_ranges_lock) {
+            while (!list.empty()) {
+                auto& pr = list.front();
+                list.pop_front();
+                trace_nc_free(&pr, pr.size);
+                free_page_ranges.free(&pr);
+            }
+        }
+    }
+
+    struct header_size_cmp {
+        bool operator()(const header& a, const header& b) const {
+            return a.hole_size < b.hole_size;
+        }
+    };
+    struct header_addr_cmp {
+        bool operator()(const header& a, const header& b) const {
+            return a.address < b.address;
+        }
+    };
+    header _dummy;
+    bi::multiset<header,
+                 bi::compare<header_size_cmp>,
+                 bi::member_hook<header,
+                                 bi::set_member_hook<>,
+                                 &header::hole_size_hook>,
+                 bi::constant_time_size<false>> _free;
+    bi::set<header,
+            bi::compare<header_addr_cmp>,
+            bi::member_hook<header,
+                            bi::set_member_hook<>,
+                            &header::address_hook>,
+            bi::constant_time_size<false>> _alloc;
+
+    mutex _lock;
+};
+
+noncontig_allocator noncontig_memory
+    __attribute__((init_priority((int)init_prio::fpranges)));
+
+noncontig_allocator::noncontig_allocator()
+    : last_addr((char*)base)
+    , _dummy({ reinterpret_cast<void*>(base + mmu::mem_area_size),
+               0, mmu::mem_area_size })
+{
+    _free.insert(_dummy);
+}
+
+void* noncontig_allocator::alloc(size_t size)
+{
+    page_range_list list;
+    auto free_memory = defer([this, &list] { free_list(list); });
+
+    auto left = size;
+    WITH_LOCK(free_page_ranges_lock) {
+        while (left > 0) {
+            auto pr = free_page_ranges.alloc(left, page_size);
+            if (!pr) {
+                return nullptr;
+            }
+            trace_nc_alloc(pr, pr->size);
+            list.push_back(*pr);
+            left -= pr->size;
+        }
+    }
+
+    void* addr;
+    WITH_LOCK(_lock) {
+ /*       auto it = _free.rbegin();
+        auto& hole = *it;
+        if (hole.hole_size < size) {
+            return nullptr;
+        }
+        _free.erase(_free.iterator_to(*it));
+        addr = hole.address - hole.hole_size;
+        hole.hole_size -= size;
+        if (hole.hole_size) {
+            _free.insert(hole);
+        }
+*/
+        addr = last_addr.fetch_add(size);
+        mmu::vpopulate_preallocated(addr, size, list);
+        assert(list.empty());
+
+        auto& hdr = *new (addr) header;
+        hdr.size = size;
+        hdr.hole_size = 0;
+        hdr.address = addr;
+        //_alloc.insert(hdr);
+    }
+    return addr;
+}
+
+void noncontig_allocator::free(void* addr)
+{
+    page_range_list list;
+    WITH_LOCK(_lock) {
+        auto& hdr = *static_cast<header*>(addr);
+/*        auto it = _alloc.iterator_to(hdr);
+        auto nit = boost::next(_alloc.iterator_to(hdr));
+        header* next;
+        if (nit == _alloc.end()) {
+            next = &_dummy;
+        } else {
+            next = &*nit;
+        }
+        assert(next->address - next->hole_size == addr + hdr.size);
+        if (next->hole_size) {
+            _free.erase(_free.iterator_to(*next));
+        }
+        if (hdr.hole_size) {
+            _free.erase(_free.iterator_to(hdr));
+        }
+        next->hole_size += hdr.size + hdr.hole_size;
+        _free.insert(*next);
+        _alloc.erase(it);
+*/
+        auto size = hdr.size;
+        mmu::vdepopulate_preallocated(addr, size, list);
+        mmu::vcleanup(addr, size);
+    }
+
+    free_list(list);
+}
+
+static void* malloc_noncontiguous(size_t size, size_t alignment)
+{
+    assert(size >= alignment);
+    assert(size > page_size);
+    auto requested_size = size;
+    auto header_size = align_up(sizeof(noncontig_allocator::header), alignment);
+    size = align_up(size + header_size, page_size);
+    auto ptr = noncontig_memory.alloc(size);
+    if (!ptr) {
+        return nullptr;
+    }
+    ptr += header_size;
+    on_alloc(size); // locks ////////////////////////////////////////////////////////
+    trace_memory_malloc_noncontig(ptr, requested_size, size, alignment);
+    return ptr;
+}
+
+static void* malloc_large(size_t size, size_t alignment, bool contiguous)
 {
     auto requested_size = size;
     size_t offset;
@@ -805,18 +975,28 @@ static void* malloc_large(size_t size, size_t alignment)
     while (true) {
         WITH_LOCK(free_page_ranges_lock) {
             reclaimer_thread.wait_for_minimum_memory();
-            page_range* ret_header;
-            if (alignment > page_size) {
-                ret_header = free_page_ranges.alloc_aligned(size, page_size, alignment);
-            } else {
-                ret_header = free_page_ranges.alloc(size);
+            if (alignment > page_size || contiguous) {
+                page_range* ret_header;
+                if (alignment > page_size) {
+                    ret_header = free_page_ranges.alloc_aligned(size, page_size, alignment);
+                } else {
+                    ret_header = free_page_ranges.alloc(size);
+                }
+                if (ret_header) {
+                    on_alloc(size);
+                    void* obj = ret_header;
+                    obj += offset;
+                    trace_memory_malloc_large(obj, requested_size, size, alignment);
+                    return obj;
+                }
             }
-            if (ret_header) {
-                on_alloc(size);
-                void* obj = ret_header;
-                obj += offset;
-                trace_memory_malloc_large(obj, requested_size, size, alignment);
-                return obj;
+            if (!contiguous) {
+                DROP_LOCK(free_page_ranges_lock) {
+                    auto ptr = malloc_noncontiguous(requested_size, alignment);
+                    if (ptr) {
+                        return ptr;
+                    }
+                }
             }
             reclaimer_thread.wait_for_memory(size);
         }
@@ -1003,6 +1183,7 @@ void reclaimer::_do_reclaim()
     }
 }
 
+
 // Return a page range back to free_page_ranges. Note how the size of the
 // page range is range->size, but its start is at range itself.
 static void free_page_range_locked(page_range *range)
@@ -1039,6 +1220,22 @@ static unsigned large_object_size(void *obj)
     return header->size;
 }
 
+static unsigned noncontiguous_object_size(void *obj)
+{
+    obj = align_down(obj - 1, page_size);
+    auto header = static_cast<noncontig_allocator::header*>(obj);
+    return header->size;
+}
+
+static void free_noncontiguous(void *obj)
+{
+    obj = align_down(obj - 1, page_size);
+    auto header = static_cast<noncontig_allocator::header*>(obj);
+    trace_memory_free_noncontig(header, header->size);
+    on_free(header->size);  //// locks///////////////////////////////////////////////////////////
+    noncontig_memory.free(header);
+}
+
 struct page_buffer {
     static constexpr size_t max = 512;
     size_t nr = 0;
@@ -1067,8 +1264,14 @@ static void refill_page_buffer()
             auto limit = (pbuf.max + 1) / 2;
 
             while (pbuf.nr < limit) {
-                pbuf.free[pbuf.nr++] = static_cast<void*>(free_page_ranges.alloc(page_size));
-                total_size += page_size;
+                auto left = (limit - pbuf.nr) * page_size;
+                auto pr = free_page_ranges.alloc(left, page_size, true);
+                assert(pr);
+                while (pr->size) {
+                    pbuf.free[pbuf.nr++] = static_cast<void*>(pr) + pr->size - page_size;
+                    total_size += page_size;
+                    pr->size -= page_size;
+                }
             }
         }
         // That will wake up the reclaimer, we can't do that while holding the preempt_lock
@@ -1264,7 +1467,7 @@ static inline void* std_malloc(size_t size, size_t alignment)
                                        memory::alloc_page());
         trace_memory_malloc_page(ret, size, mmu::page_size, alignment);
     } else {
-        ret = memory::malloc_large(size, alignment);
+        ret = memory::malloc_large(size, alignment, false);
     }
     memory::tracker_remember(ret, size);
     return ret;
@@ -1291,6 +1494,8 @@ static size_t object_size(void *object)
         object = mmu::translate_mem_area(mmu::mem_area::mempool,
                                          mmu::mem_area::main, object);
         return memory::pool::from_object(object)->get_size();
+    case mmu::mem_area::non_contig:
+        return memory::noncontiguous_object_size(object);
     case mmu::mem_area::page:
         return mmu::page_size;
     default:
@@ -1336,6 +1541,8 @@ void free(void* object)
         object = mmu::translate_mem_area(mmu::mem_area::mempool,
                                          mmu::mem_area::main, object);
         return memory::pool::from_object(object)->free(object);
+    case mmu::mem_area::non_contig:
+        return memory::free_noncontiguous(object);
     case mmu::mem_area::debug:
         return dbg::free(object);
     default:
@@ -1546,7 +1753,7 @@ void* alloc_phys_contiguous_aligned(size_t size, size_t align)
     assert(is_power_of_two(align));
     // make use of the standard large allocator returning properly aligned
     // physically contiguous memory:
-    auto ret = malloc_large(size, align);
+    auto ret = malloc_large(size, align, true);
     assert (!(reinterpret_cast<uintptr_t>(ret) & (align - 1)));
     return ret;
 }

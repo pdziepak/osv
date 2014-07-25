@@ -12,6 +12,9 @@ def is_large(x):
 def is_page(x):
     return x.find("malloc_page ") > 0
 
+def is_noncontig(x):
+    return x.find("malloc_noncontig ") > 0
+
 def get_alloc_len(x):
     return int(re.findall("alloc_len=(\d*)", x)[0])
 
@@ -45,7 +48,7 @@ def process_records(mallocs, trace_records, printer=prof.default_printer):
             # a list of object, each describing the buffer: its requested and
             # actual size, alignment and allocator.
             #
-            if is_mempool(l) or is_large(l) or is_page(l):
+            if is_mempool(l) or is_large(l) or is_page(l) or is_noncontig(l):
                 buf = get_buf(l)
                 b = Buffer(buf,
                            alloc_type=get_type(l),

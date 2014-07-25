@@ -97,6 +97,12 @@ struct page_range {
     boost::intrusive::list_member_hook<> list_hook;
 };
 
+typedef boost::intrusive::list<page_range,
+                               boost::intrusive::member_hook<page_range,
+                               boost::intrusive::list_member_hook<>,
+                               &page_range::list_hook>,
+                               boost::intrusive::constant_time_size<false>> page_range_list;
+
 void free_initial_memory_range(void* addr, size_t size);
 void enable_debug_allocator();
 
@@ -274,5 +280,8 @@ public:
 extern reclaimer_lock_type reclaimer_lock;
 
 }
-
+namespace mmu {
+void vpopulate_preallocated(void* addr, size_t size, memory::page_range_list& list);
+void vdepopulate_preallocated(void* addr, size_t size, memory::page_range_list& list);
+}
 #endif

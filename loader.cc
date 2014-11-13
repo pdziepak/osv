@@ -68,6 +68,11 @@ elf::tls_data tls_data;
 
 boot_time_chart boot_time;
 
+void test_cxxx()
+{
+    throw 123;
+}
+
 void setup_tls(elf::init_table inittab)
 {
     tls_data = inittab.tls;

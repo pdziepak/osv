@@ -544,6 +544,16 @@ symbol_module object::symbol(unsigned idx)
     return ret;
 }
 
+const char* object::symbol_nm(unsigned idx)
+{
+    auto symtab = dynamic_ptr<Elf64_Sym>(DT_SYMTAB);
+    assert(dynamic_val(DT_SYMENT) == sizeof(Elf64_Sym));
+    auto sym = &symtab[idx];
+    auto nameidx = sym->st_name;
+    auto name = dynamic_ptr<const char>(DT_STRTAB) + nameidx;
+    return name;
+}
+
 void object::relocate_rela()
 {
     auto rela = dynamic_ptr<Elf64_Rela>(DT_RELA);

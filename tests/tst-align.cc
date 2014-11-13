@@ -20,6 +20,9 @@
 
 #include <stdlib.h>
 #include <malloc.h>
+#include <osv/debug.hh>
+
+extern void test_cxxx();
 
 static int tests = 0, fails = 0;
 
@@ -62,6 +65,16 @@ void test_posix_memalign(size_t alignment, size_t size)
 
 int main(int ac, char** av)
 {
+    try {
+        test_cxxx();
+    }
+    catch (int x) {
+        std::cout << "OK!\n" << x << "\n";
+    }
+    catch (...) {
+        std::cout << "almost\n";
+    }
+
     // posix_memalign expects its alignment argument to be a multiple of
     // sizeof(void*) (on 64 bit, that's 8 bytes) and a power of two.
     for (int shift = 3; shift <= 14; shift++) {

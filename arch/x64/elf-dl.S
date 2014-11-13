@@ -8,6 +8,69 @@
 
 .text
 
+.global kernel_entry
+.global kernel_entry_info
+
+.align 16
+kernel_entry:
+    .type kernel_entry, @function
+    .cfi_startproc
+    .cfi_personality 0, kernel_entry_personality
+    .cfi_def_cfa %rsp, 0
+    .cfi_rel_offset %rip, 0
+
+    mov %fs:return_address_c@tpoff, %r11
+    test %r11, %r11
+    jnz 4f
+    addq $1, %fs:return_address_c@tpoff
+
+    mov %fs:return_address_p@tpoff, %r11
+    mov %r15, %fs:return_address@tpoff(, %r11, 8)
+    addq $1, %fs:return_address_p@tpoff
+
+    mov (%rsp), %r15
+    mov %r15, %fs:return_addressr@tpoff(, %r11, 8)
+    .cfi_undefined %r15
+    .cfi_register %rip, %r15
+
+    movq $2f, (%rsp)
+1:  movabs $0, %r11
+    jmp *%r11
+4:
+    jmp .
+2:  push %r15
+    .cfi_restore %rip
+
+    subq $1, %fs:return_address_p@tpoff
+    mov %fs:return_address_p@tpoff, %r11
+    mov %fs:return_address@tpoff(, %r11, 8), %r15
+    movq $0, %fs:return_address@tpoff(, %r11, 8)
+    .cfi_same_value %r15
+    subq $1, %fs:return_address_c@tpoff
+    ret
+3:
+    push %r15
+    .cfi_rel_offset %rip, 0
+
+    subq $1, %fs:return_address_p@tpoff
+    mov %fs:return_address_p@tpoff, %r11
+    mov %fs:return_address@tpoff(, %r11, 8), %r15
+    .cfi_same_value %r15
+
+    subq $1, %fs:return_address_c@tpoff
+
+    mov %rax, %rdi
+    call _Unwind_Resume
+    call abort
+
+    .cfi_endproc
+
+
+kernel_entry_info:
+    .quad 1b - kernel_entry
+    .quad 2b - kernel_entry
+    .quad 3b
+
 .global __elf_resolve_pltgot
 
 // calling convension:

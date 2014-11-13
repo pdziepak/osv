@@ -315,6 +315,7 @@ public:
     void* base() const;
     void* end() const;
     Elf64_Sym* lookup_symbol(const char* name);
+    const char* symbol_nm(unsigned idx);
     void load_segments();
     void unload_segments();
     void fix_permissions();
